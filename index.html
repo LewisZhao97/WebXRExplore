@@ -1,0 +1,224 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WebXR 手势控制粒子弹性聚合</title>
+    <style>
+        body { margin: 0; overflow: hidden; background-color: #000; }
+        #info {
+            position: absolute;
+            top: 10px;
+            width: 100%;
+            text-align: center;
+            color: white;
+            pointer-events: none;
+            font-family: sans-serif;
+            z-index: 100;
+        }
+    </style>
+</head>
+<body>
+    <div id="info">请在支持 WebXR 和手势追踪的设备中打开 (如 Meta Quest)</div>
+
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+            }
+        }
+    </script>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { XRButton } from 'three/addons/webxr/XRButton.js';
+        import { XRHandModelFactory } from 'three/addons/webxr/XRHandModelFactory.js';
+
+        let container;
+        let camera, scene, renderer;
+        let hand1, hand2;
+        let handModelFactory;
+        let particles;
+        
+        // 粒子相关参数
+        const particleCount = 5000;
+        const basePositions = new Float32Array(particleCount * 3); // 存储粒子扩散时的原始位置
+        const scatterRadius = 2.0; // 粒子最大扩散半径
+
+        // 动画物理参数 (用于弹性效果)
+        let currentScatterFactor = 0; // 当前扩散系数 (0=聚集, 1=扩散)
+        let targetScatterFactor = 0;  // 目标扩散系数
+        let scatterVelocity = 0;      // 变化速度
+        const springStiffness = 0.08; // 弹簧硬度 (越大回弹越快)
+        const springDamping = 0.85;    // 阻尼系数 (越小回弹次数越多)
+
+        // 颜色循环参数
+        let colorHue = 0;
+
+        init();
+        animate();
+
+        function init() {
+            container = document.createElement('div');
+            document.body.appendChild(container);
+
+            scene = new THREE.Scene();
+            // 稍微调暗背景，让粒子更明显
+            scene.background = new THREE.Color(0x111111);
+
+            camera = new THREE.PerspectiveCamera(50, window.innerWidth / window.innerHeight, 0.1, 10);
+            camera.position.set(0, 1.6, 3);
+
+            // --- 创建粒子系统 ---
+            const geometry = new THREE.BufferGeometry();
+            
+            // 初始化粒子基础位置 (随机分布在一个球体内)
+            for (let i = 0; i < particleCount; i++) {
+                const i3 = i * 3;
+                // 使用球坐标生成均匀分布的点，然后转换回笛卡尔坐标
+                const u = Math.random();
+                const v = Math.random();
+                const theta = u * 2.0 * Math.PI;
+                const phi = Math.acos(2.0 * v - 1.0);
+                const r = Math.cbrt(Math.random()) * scatterRadius; // 使用立方根确保球体内分布均匀
+
+                basePositions[i3] = r * Math.sin(phi) * Math.cos(theta);
+                basePositions[i3 + 1] = r * Math.sin(phi) * Math.sin(theta) + 1.5; // 抬高中心点到视线高度
+                basePositions[i3 + 2] = r * Math.cos(phi);
+            }
+            
+            // 设置初始位置 (初始状态为聚集在中心)
+            geometry.setAttribute('position', new THREE.BufferAttribute(basePositions.slice(), 3));
+
+            const material = new THREE.PointsMaterial({
+                color: 0xffffff,
+                size: 0.015,
+                blending: THREE.AdditiveBlending, // 发光效果
+                transparent: true,
+                opacity: 0.8,
+                depthWrite: false // 避免粒子相互遮挡的渲染问题
+            });
+
+            particles = new THREE.Points(geometry, material);
+            scene.add(particles);
+
+            // --- Renderer 设置 ---
+            renderer = new THREE.WebGLRenderer({ antialias: true });
+            renderer.setPixelRatio(window.devicePixelRatio);
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.xr.enabled = true; // 启用 WebXR
+            container.appendChild(renderer.domElement);
+
+            // 添加 WebXR 按钮，请求 'hand-tracking' 功能
+            document.body.appendChild(XRButton.createButton(renderer, { 
+                optionalFeatures: ['local-floor', 'bounded-floor', 'hand-tracking'] 
+            }));
+
+            // --- WebXR 手势控制器设置 ---
+            handModelFactory = new XRHandModelFactory();
+
+            // 手 1
+            hand1 = renderer.xr.getHand(0);
+            hand1.add(handModelFactory.createHandModel(hand1, { model: 'lowpoly' })); // 添加低多边形手模型用于视觉反馈
+            scene.add(hand1);
+
+            // 手 2
+            hand2 = renderer.xr.getHand(1);
+            hand2.add(handModelFactory.createHandModel(hand2, { model: 'lowpoly' }));
+            scene.add(hand2);
+
+            window.addEventListener('resize', onWindowResize);
+        }
+
+        function onWindowResize() {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        }
+
+        // 计算手掌张开程度 (0 = 握拳, 1 = 张开)
+        // 通过计算手腕到食指指尖的距离来估算
+        function getHandOpenness(hand) {
+            if (!hand || !hand.joints || !hand.joints['wrist'] || !hand.joints['index-finger-tip']) {
+                return 0;
+            }
+            
+            const wrist = hand.joints['wrist'];
+            const indexTip = hand.joints['index-finger-tip'];
+
+            // 计算世界坐标系下的距离
+            const distance = wrist.position.distanceTo(indexTip.position);
+
+            // 定义经验值：握拳时大概距离 vs 张开时大概距离 (单位：米)
+            // 这些值可能需要根据实际体验微调
+            const closedDistance = 0.08; 
+            const openDistance = 0.18; 
+
+            // 将距离映射到 0~1 之间，并进行钳制(Clamp)
+            let openness = (distance - closedDistance) / (openDistance - closedDistance);
+            openness = Math.max(0, Math.min(1, openness)); // 确保在 0-1 范围内
+
+            return openness;
+        }
+
+        function animate() {
+            renderer.setAnimationLoop(render);
+        }
+
+        function render() {
+            const delta = 0.016; // 假设 60fps，用于物理计算
+
+            // --- 1. 获取手势输入 ---
+            let openFactor1 = getHandOpenness(hand1);
+            let openFactor2 = getHandOpenness(hand2);
+            // 取两只手中张开程度最大的作为目标值
+            targetScatterFactor = Math.max(openFactor1, openFactor2);
+
+            // 如果没有检测到手，默认缓慢回到聚集状态
+            if (!hand1.visible && !hand2.visible) {
+                 targetScatterFactor = 0.1; // 稍微留一点点散开，不要完全缩成一个点
+            }
+
+
+            // --- 2. 弹性物理模拟 (Spring Physics) ---
+            // 计算弹簧力：距离目标的差值 * 硬度
+            const force = (targetScatterFactor - currentScatterFactor) * springStiffness;
+            // 更新速度：加上力，并乘以阻尼衰减
+            scatterVelocity += force;
+            scatterVelocity *= springDamping;
+            // 更新当前位置
+            currentScatterFactor += scatterVelocity;
+
+            // 防止数值爆炸或变为负数 (虽然物理公式通常能自控，但加个保险)
+            currentScatterFactor = Math.max(0.0, currentScatterFactor);
+
+
+            // --- 3. 更新粒子位置 ---
+            const positions = particles.geometry.attributes.position.array;
+            // 聚合中心点 (可以根据需要修改，目前设定在高度 1.5m 处)
+            const centerPoint = new THREE.Vector3(0, 1.5, 0);
+
+            for (let i = 0; i < particleCount; i++) {
+                const i3 = i * 3;
+                // 线性插值 (Lerp): 在中心点和基础扩散位置之间，根据 currentScatterFactor 进行插值
+                // Position = Center + (Base - Center) * Factor
+                positions[i3]     = centerPoint.x + (basePositions[i3]     - centerPoint.x) * currentScatterFactor;
+                positions[i3 + 1] = centerPoint.y + (basePositions[i3 + 1] - centerPoint.y) * currentScatterFactor;
+                positions[i3 + 2] = centerPoint.z + (basePositions[i3 + 2] - centerPoint.z) * currentScatterFactor;
+            }
+            // 告诉 Three.js 位置数据已更新，需要重新上传到 GPU
+            particles.geometry.attributes.position.needsUpdate = true;
+
+
+            // --- 4. 颜色循环更新 ---
+            colorHue += 0.002; // 调整速度
+            if (colorHue > 1) colorHue = 0;
+            // 使用 HSL 设置颜色，实现彩虹循环
+            particles.material.color.setHSL(colorHue, 1.0, 0.5);
+
+            renderer.render(scene, camera);
+        }
+    </script>
+</body>
+</html>
