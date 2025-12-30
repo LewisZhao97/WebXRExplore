@@ -229,168 +229,116 @@
 <html>
   <head>
     <meta charset="utf-8">
-    <title>WebXR Shooter Fix</title>
+    <title>WebXR Dual Hand Shooter</title>
     <script src="https://aframe.io/releases/1.7.1/aframe.min.js"></script>
     <script src="https://cdn.jsdelivr.net/gh/c-frame/aframe-physics-system@v4.2.4/dist/aframe-physics-system.min.js"></script>
 
     <script>
-      // === 全局调试帮助函数 ===
-      function logToVR(msg) {
-        const debugText = document.getElementById('debug-text');
-        if (debugText) {
-          let currentText = debugText.getAttribute('value') || "";
-          let lines = currentText.split('\n');
-          if (lines.length > 6) lines.shift(); 
-          lines.push(msg);
-          debugText.setAttribute('value', lines.join('\n'));
-        }
-      }
-
       AFRAME.registerComponent('finger-shooter', {
         schema: {
-          interval: {type: 'number', default: 2000},
-          speed: {type: 'number', default: 5}
+          interval: {type: 'number', default: 2000}, // 每2秒
+          speed: {type: 'number', default: 30}      // 提升后的初速度
         },
 
         init: function () {
           this.timer = 0;
-          this.logTimer = 0;
-          logToVR("System Init: Waiting for hand...");
         },
 
         tick: function (time, timeDelta) {
           this.timer += timeDelta;
-          this.logTimer += timeDelta;
-
           if (this.timer >= this.data.interval) {
             this.shoot();
+            this.timer = 0;
           }
         },
 
         shoot: function () {
           const meshObject = this.el.getObject3D('mesh');
-          
-          if (!meshObject) {
-            if (this.logTimer > 2000) { 
-                logToVR("Waiting: No mesh found yet...");
-                this.logTimer = 0;
-            }
-            return;
-          }
+          if (!meshObject) return;
 
-          // === 核心修复：使用 getObjectByName 深度查找 ===
-          // WebXR 标准骨骼名称列表：https://www.w3.org/TR/webxr-hand-input-1/#skeleton-joints
-          // 我们尝试查找标准名称
-          
-          // 1. 查找食指尖 (Tip)
-          let tipBone = meshObject.getObjectByName('index-finger-tip');
-          // 兼容性尝试：有些设备可能带有前缀
-          if (!tipBone) tipBone = meshObject.getObjectByName('right-index-finger-tip');
-          
-          // 2. 查找食指根部 (Proximal Phalanx)
-          let knuckleBone = meshObject.getObjectByName('index-finger-phalanx-proximal');
-          if (!knuckleBone) knuckleBone = meshObject.getObjectByName('right-index-finger-phalanx-proximal');
+          // 自动适配左/右手前缀
+          const isLeft = this.el.getAttribute('hand-tracking-controls').hand === 'left';
+          const prefix = isLeft ? 'left' : 'right';
 
-          // 如果还没找到，打印一次所有子对象的名称到控制台（PC端调试用）
-          if ((!tipBone || !knuckleBone) && !this.debuggedOnce) {
-            console.log("Dumping mesh children names for debug:");
-            meshObject.traverse((node) => {
-                if (node.isBone) console.log("Bone found:", node.name);
-            });
-            this.debuggedOnce = true;
-          }
-
-          if (!tipBone || !knuckleBone) {
-            if (this.logTimer > 2000) {
-                logToVR("Error: Mesh found, but bones not named correctly.");
-                this.logTimer = 0;
-            }
-            return;
-          }
-
-          // === 找到骨骼了，开始计算 ===
+          // 查找骨骼：尝试标准名及带前缀的名称
+          let tipBone = meshObject.getObjectByName(`${prefix}-index-finger-tip`) || 
+                        meshObject.getObjectByName('index-finger-tip');
           
-          // 获取世界坐标
+          let knuckleBone = meshObject.getObjectByName(`${prefix}-index-finger-phalanx-proximal`) || 
+                            meshObject.getObjectByName('index-finger-phalanx-proximal');
+
+          if (!tipBone || !knuckleBone) return;
+
           const tipPos = new THREE.Vector3();
           tipBone.getWorldPosition(tipPos);
 
           const knucklePos = new THREE.Vector3();
           knuckleBone.getWorldPosition(knucklePos);
 
-          // 计算方向：从指根 -> 指尖
+          // 计算方向并应用速度
           const direction = new THREE.Vector3().subVectors(tipPos, knucklePos).normalize();
-
-          logToVR("BANG! Shooting ball...");
-          
-          // 发射小球
           this.createBall(tipPos, direction);
-          this.timer = 0;
         },
 
         createBall: function (position, direction) {
-          const scene = this.el.sceneEl;
           const ball = document.createElement('a-sphere');
-
-          ball.setAttribute('radius', '0.01');
+          ball.setAttribute('radius', '0.02'); // 4cm 直径
           ball.setAttribute('position', position);
           
           const randomColor = '#' + Math.floor(Math.random()*16777215).toString(16);
-          ball.setAttribute('material', {color: randomColor, roughness: 0.2, metalness: 0.1});
-          ball.setAttribute('shadow', 'cast: true; receive: true');
-
-          // 物理属性
-          ball.setAttribute('dynamic-body', {
-            mass: 0.1,
-            shape: 'sphere',
-            linearDamping: 0.01,
-            angularDamping: 0.01
+          ball.setAttribute('material', {
+            color: randomColor, 
+            roughness: 0.1, 
+            metalness: 0.3 
           });
 
-          scene.appendChild(ball);
+          // 物理属性：给小球也增加摩擦力系数
+          ball.setAttribute('dynamic-body', {
+            mass: 0.2,
+            linearDamping: 0.05, // 稍微增加空气阻力，让轨迹更自然
+            angularDamping: 0.05
+          });
+
+          this.el.sceneEl.appendChild(ball);
 
           ball.addEventListener('body-loaded', () => {
             if (ball.body) {
-                // Cannon.js 速度设置
-                const velocity = new CANNON.Vec3(
-                    direction.x * this.data.speed,
-                    direction.y * this.data.speed,
-                    direction.z * this.data.speed
-                );
-                ball.body.velocity.copy(velocity);
+              const v = new CANNON.Vec3(
+                direction.x * this.data.speed,
+                direction.y * this.data.speed,
+                direction.z * this.data.speed
+              );
+              ball.body.velocity.copy(v);
             }
           });
 
-          // 10秒后清理
+          // 自动回收
           setTimeout(() => {
             if (ball.parentNode) ball.parentNode.removeChild(ball);
-          }, 10000);
+          }, 8000);
         }
       });
     </script>
   </head>
   <body>
-    <a-scene physics="gravity: -9.8; debug: false" background="color: #333">
+    <a-scene physics="gravity: -9.8; debug: false" background="color: #222" shadow="type: pcfsoft">
       
-      <a-entity position="0 1.6 -1">
-        <a-text id="debug-text" 
-                value="Initializing..." 
-                align="center" 
-                color="yellow" 
-                width="2"
-                position="0 0 0">
-        </a-text>
-        <a-plane color="black" opacity="0.6" width="2" height="1.2" position="0 0 -0.01"></a-plane>
-      </a-entity>
+      <a-entity light="type: ambient; intensity: 0.5"></a-entity>
+      <a-entity light="type: directional; intensity: 0.8; castShadow: true; shadowCameraTop: 10; shadowCameraRight: 10" 
+                position="1 5 1"></a-entity>
 
-      <a-entity light="type: ambient; intensity: 0.6"></a-entity>
-      <a-entity light="type: directional; intensity: 0.8; castShadow: true" position="-1 4 2"></a-entity>
-
-      <a-plane position="0 0 0" rotation="-90 0 0" width="50" height="50" color="#7BC8A4" static-body shadow="receive: true"></a-plane>
+      <a-plane position="0 0 0" 
+               rotation="-90 0 0" 
+               width="100" height="100" 
+               color="#888" 
+               static-body="friction: 1.0; restitution: 0.2" 
+               shadow="receive: true">
+      </a-plane>
       
-      <a-entity id="rig" position="0 0 0">
-        <a-camera position="0 1.6 0" look-controls="magicWindowTrackingEnabled: false"></a-camera>
+      <a-entity id="rig">
+        <a-camera position="0 1.6 0"></a-camera>
         
-        <a-entity hand-tracking-controls="hand: left; modelStyle: mesh"></a-entity>
+        <a-entity hand-tracking-controls="hand: left; modelStyle: mesh" finger-shooter></a-entity>
         
         <a-entity hand-tracking-controls="hand: right; modelStyle: mesh" finger-shooter></a-entity>
       </a-entity>
